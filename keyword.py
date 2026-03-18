@@ -202,6 +202,86 @@ def analyze_keyword(df: pd.DataFrame, keyword: str) -> Tuple[pd.DataFrame, pd.Da
     return summary, detail
 
 
+def init_session() -> None:
+    if "results_df" not in st.session_state:
+        st.session_state.results_df = pd.DataFrame()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+init_session()
+
+st.title("Ringover · Transcripciones por agente")
+st.caption("Sube un CSV con call_id y agente, descarga transcripciones desde Ringover y analiza keywords por agente.")
+
+with st.sidebar:
+    st.header("Configuración")
+    api_key = st.text_input("API key de Ringover", type="password")
+    keyword = st.text_input("Palabra o frase a buscar", value="Asegura facil")
+    sleep_ms = st.number_input(
+        "Pausa entre llamadas a la API (ms)",
+        min_value=0,
+        max_value=5000,
+        value=200,
+        step=50,
+    )
+    only_success = st.checkbox("Ocultar filas con error", value=False)
+
+uploaded_file = st.file_uploader("Sube el CSV con columnas call_id y agente", type=["csv"])
+
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    run_button = st.button("Descargar y analizar", type="primary", use_container_width=True)
+with col_b:
+    clear_button = st.button("Limpiar resultados", use_container_width=True)
+
+if clear_button:
+    st.session_state.results_df = pd.DataFrame()
+    st.rerun()
+
+if uploaded_file is not None:
+    try:
+        source_df = pd.read_csv(uploaded_file, dtype=str)
+    except Exception:
+        source_df = pd.read_csv(uploaded_file, sep="\t", dtype=str)
+
+    source_df.columns = [c.strip() for c in source_df.columns]
+    st.subheader("Vista previa del fichero")
+    st.dataframe(source_df.head(10), use_container_width=True)
+
+    missing = [c for c in ["call_id", "agente"] if c not in source_df.columns]
+    if missing:
+        st.error(f"Faltan columnas obligatorias: {missing}")
+        st.stop()
+
+    if run_button:
+        if not api_key.strip():
+            st.error("Introduce la API key de Ringover.")
+            st.stop()
+
+        work = source_df[["call_id", "agente"]].copy()
+        work["call_id"] = work["call_id"].apply(clean_call_id)
+        work["agente"] = work["agente"].fillna("").astype(str).str.strip()
+        work = work[work["call_id"] != ""].copy()
+        work = work.drop_duplicates(subset=["call_id", "agente"])
+
+        headers = make_headers(api_key)
+        rows: List[Dict[str, Any]] = []
+        progress = st.progress(0)
+        status = st.empty()
+
+        total = len(work)
+        for idx, row in enumerate(work.itertuples(index=False), start=1):
+            call_id = row.call_id
+            agente = row.agente
+            status.info(f"Procesando {idx}/{total} · call_id={call_id} · agente={agente}")
+            rows.append(fetch_one_call(call_id, agente, headers, sleep_ms=int(sleep_ms)))
+            progress.progress(idx / total)
+
+        st.session_state.results_df = pd.DataFrame(rows)
+        status.success("Proceso completado.")
+
 results_df = st.session_state.results_df
 
 if not results_df.empty:
@@ -221,7 +301,6 @@ if not results_df.empty:
     r4.metric("% con transcripción", f"{pct_con_transcripcion}%")
 
     view_df = results_df.copy()
-    view_df["tiene_transcripcion"] = view_df["text"].fillna("").astype(str).str.strip() != ""
 
     if only_success:
         view_df = view_df[view_df["error"].isna() | (view_df["error"] == "")]
@@ -243,7 +322,14 @@ if not results_df.empty:
 
         st.subheader(f"Análisis de keyword: {keyword}")
         total_calls = len(view_df)
-        calls_with_keyword = int((view_df["text"].fillna("").astype(str).apply(lambda x: count_mentions(x, keyword) > 0)).sum())
+        calls_with_keyword = int(
+            (
+                view_df["text"]
+                .fillna("")
+                .astype(str)
+                .apply(lambda x: count_mentions(x, keyword) > 0)
+            ).sum()
+        )
         pct_total = round((calls_with_keyword / total_calls) * 100, 2) if total_calls else 0
 
         m1, m2, m3 = st.columns(3)
@@ -265,7 +351,40 @@ if not results_df.empty:
 
         st.markdown("### Detalle de llamadas con coincidencia")
         st.dataframe(
-            detail_df[[c for c in ["call_id", "agente", "start_time", "duration", "speaker", "mentions", "text", "error"] if c in detail_df.columns]],
+            detail_df[
+                [
+                    c for c in [
+                        "call_id",
+                        "agente",
+                        "start_time",
+                        "duration",
+                        "speaker",
+                        "mentions",
+                        "text",
+                        "error",
+                    ]
+                    if c in detail_df.columns
+                ]
+            ],
+            use_container_width=True,
+        )
+
+        st.markdown("### Llamadas sin transcripción")
+        sin_transcripcion_df = view_df[~view_df["tiene_transcripcion"]].copy()
+        st.dataframe(
+            sin_transcripcion_df[
+                [
+                    c for c in [
+                        "call_id",
+                        "agente",
+                        "start_time",
+                        "duration",
+                        "speaker",
+                        "error",
+                    ]
+                    if c in sin_transcripcion_df.columns
+                ]
+            ],
             use_container_width=True,
         )
 else:
