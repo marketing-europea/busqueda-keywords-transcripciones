@@ -450,20 +450,26 @@ with tab2:
 
             st.subheader(f"Análisis de keyword: {keyword}")
             total_calls = len(view_df)
-            calls_with_keyword = int(
-                (
-                    view_df["text"]
-                    .fillna("")
-                    .astype(str)
-                    .apply(lambda x: count_mentions(x, keyword) > 0)
-                ).sum()
-            )
-            pct_total = round((calls_with_keyword / total_calls) * 100, 2) if total_calls else 0
 
-            m1, m2, m3 = st.columns(3)
+            view_df["mentions_keyword"] = (
+                view_df["text"]
+                .fillna("")
+                .astype(str)
+                .apply(lambda x: count_mentions(x, keyword))
+            )
+            view_df["has_keyword_search"] = view_df["mentions_keyword"] > 0
+
+            calls_with_keyword = int(view_df["has_keyword_search"].sum())
+            calls_without_keyword = total_calls - calls_with_keyword
+
+            pct_total = round((calls_with_keyword / total_calls) * 100, 2) if total_calls else 0
+            pct_without = round((calls_without_keyword / total_calls) * 100, 2) if total_calls else 0
+
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total llamadas", total_calls)
             m2.metric("Llamadas con keyword", calls_with_keyword)
-            m3.metric("% sobre total", f"{pct_total}%")
+            m3.metric("% con keyword", f"{pct_total}%")
+            m4.metric("Llamadas sin keyword", calls_without_keyword)
 
             st.markdown("### Resumen por agente")
             st.dataframe(summary_df, use_container_width=True)
@@ -479,7 +485,7 @@ with tab2:
 
             st.markdown("### Detalle de llamadas con coincidencia")
             st.dataframe(
-                detail_df[
+                view_df[view_df["has_keyword_search"]][
                     [
                         c for c in [
                             "call_id",
@@ -487,16 +493,63 @@ with tab2:
                             "start_time",
                             "duration",
                             "speaker",
-                            "mentions",
+                            "mentions_keyword",
                             "text",
                             "error",
                         ]
-                        if c in detail_df.columns
+                        if c in view_df.columns or c == "mentions_keyword"
                     ]
                 ],
                 use_container_width=True,
             )
 
+            st.markdown("### Detalle de llamadas sin coincidencia")
+            st.dataframe(
+                view_df[~view_df["has_keyword_search"]][
+                    [
+                        c for c in [
+                            "call_id",
+                            "agente",
+                            "start_time",
+                            "duration",
+                            "speaker",
+                            "mentions_keyword",
+                            "text",
+                            "error",
+                        ]
+                        if c in view_df.columns or c == "mentions_keyword"
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+            # Resumen por agente de las llamadas sin keyword
+            summary_without_df = (
+                view_df.groupby("agente", dropna=False)
+                .agg(
+                    total_llamadas=("call_id", "count"),
+                    llamadas_sin_keyword=("has_keyword_search", lambda x: (~x).sum()),
+                )
+                .reset_index()
+            )
+
+            summary_without_df["porcentaje_sin_keyword"] = (
+                summary_without_df["llamadas_sin_keyword"]
+                / summary_without_df["total_llamadas"]
+                * 100
+            ).round(2)
+
+            st.markdown("### Resumen por agente · llamadas sin coincidencia")
+            st.dataframe(summary_without_df, use_container_width=True)
+
+            summary_without_csv = io.StringIO()
+            summary_without_df.to_csv(summary_without_csv, index=False, encoding="utf-8-sig")
+            st.download_button(
+                "Descargar resumen sin keyword por agente",
+                data=summary_without_csv.getvalue(),
+                file_name="resumen_sin_keyword_por_agente.csv",
+                mime="text/csv",
+            )
         st.markdown("### Llamadas sin transcripción")
         sin_transcripcion_df = view_df[~view_df["tiene_transcripcion"]].copy()
         st.dataframe(
