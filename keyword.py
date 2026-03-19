@@ -7,8 +7,11 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Ringover Transcripciones", layout="wide")
-
+st.set_page_config(
+    page_title="Ringover Transcripciones",
+    page_icon="logo.png",  # tu logo aquí
+    layout="wide"
+)
 
 # -----------------------------
 # Helpers generales
