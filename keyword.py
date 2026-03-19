@@ -12,7 +12,24 @@ st.set_page_config(
     page_icon="REDUCCION-AES-01.png",  # tu logo aquí
     layout="wide"
 )
+def check_password() -> bool:
+    if st.session_state.get("authenticated", False):
+        return True
 
+    st.markdown("## Acceso restringido")
+    st.image("REDUCCION-AES-01.png", width=180)
+    password = st.text_input("Introduce la contraseña", type="password")
+    login_button = st.button("Entrar", type="primary", use_container_width=True)
+
+    if login_button:
+        app_password = st.secrets.get("APP_PASSWORD", "")
+        if password == app_password:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Contraseña incorrecta")
+
+    return False
 # -----------------------------
 # Helpers generales
 # -----------------------------
@@ -216,7 +233,8 @@ def analyze_keyword(df: pd.DataFrame, keyword: str) -> Tuple[pd.DataFrame, pd.Da
     detail = work[work["has_keyword"]].copy()
     return summary, detail
 
-
+if not check_password():
+    st.stop()
 def init_session() -> None:
     if "results_df" not in st.session_state:
         st.session_state.results_df = pd.DataFrame()
