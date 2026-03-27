@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,11 +8,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
+# ---------------------------------
+# CONFIG
+# ---------------------------------
 st.set_page_config(
     page_title="Ringover Transcripciones",
-    page_icon="REDUCCION-AES-01.png",  # tu logo aquí
+    page_icon="REDUCCION-AES-01.png",
     layout="wide"
 )
+
+CHECKPOINT_FILE = "ringover_checkpoint.csv"
+AUTOSAVE_EVERY = 10
+
+
+# ---------------------------------
+# AUTH
+# ---------------------------------
 def check_password() -> bool:
     if st.session_state.get("authenticated", False):
         return True
@@ -30,9 +42,38 @@ def check_password() -> bool:
             st.error("Contraseña incorrecta")
 
     return False
-# -----------------------------
-# Helpers generales
-# -----------------------------
+
+
+if not check_password():
+    st.stop()
+
+
+# ---------------------------------
+# CHECKPOINT
+# ---------------------------------
+def load_checkpoint() -> pd.DataFrame:
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            df = pd.read_csv(CHECKPOINT_FILE, dtype=str)
+            return df.fillna("")
+        except Exception as e:
+            st.warning(f"No se pudo leer el checkpoint: {e}")
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def save_checkpoint(df: pd.DataFrame) -> None:
+    df.to_csv(CHECKPOINT_FILE, index=False, encoding="utf-8-sig")
+
+
+def clear_checkpoint() -> None:
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
+
+# ---------------------------------
+# HELPERS GENERALES
+# ---------------------------------
 def normalize_text(text: str) -> str:
     if pd.isna(text):
         return ""
@@ -52,8 +93,7 @@ def count_mentions(text: str, keyword: str) -> int:
 def clean_call_id(value: Any) -> str:
     if pd.isna(value):
         return ""
-    value = str(value).strip().replace('"', "")
-    return value
+    return str(value).strip().replace('"', "")
 
 
 def extract_call_id_from_url(value: Any) -> str:
@@ -61,7 +101,6 @@ def extract_call_id_from_url(value: Any) -> str:
         return ""
 
     text = str(value).strip().replace('"', "")
-
     match = re.search(r"call-logs/(\d+)", text)
     if match:
         return match.group(1)
@@ -78,16 +117,35 @@ def safe_json(response: requests.Response) -> Any:
     return response.json()
 
 
+def request_with_retry(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int = 30,
+    retries: int = 3,
+    retry_sleep: float = 1.5
+) -> Any:
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            return safe_json(r)
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(retry_sleep)
+
+    raise last_error
+
+
 def get_call_data(call_id: str, headers: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
     url = f"https://public-api.ringover.com/v2/calls/{call_id}"
-    r = requests.get(url, headers=headers, timeout=timeout)
-    return safe_json(r)
+    return request_with_retry(url, headers=headers, timeout=timeout)
 
 
 def get_transcription_data(call_id: str, headers: Dict[str, str], timeout: int = 30) -> Any:
     url = f"https://public-api.ringover.com/v2/transcriptions/{call_id}"
-    r = requests.get(url, headers=headers, timeout=timeout)
-    return safe_json(r)
+    return request_with_retry(url, headers=headers, timeout=timeout)
 
 
 def extract_start_time_and_duration(call_response: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any]]:
@@ -234,22 +292,36 @@ def analyze_keyword(df: pd.DataFrame, keyword: str) -> Tuple[pd.DataFrame, pd.Da
     detail = work[work["has_keyword"]].copy()
     return summary, detail
 
-if not check_password():
-    st.stop()
+
+def prepare_source_df(source_df: pd.DataFrame) -> pd.DataFrame:
+    work = source_df[["call_id", "agente"]].copy()
+    work["call_id"] = work["call_id"].apply(clean_call_id)
+    work["agente"] = work["agente"].fillna("").astype(str).str.strip()
+    work = work[work["call_id"] != ""].copy()
+    work = work.drop_duplicates(subset=["call_id", "agente"])
+    return work
+
+
 def init_session() -> None:
     if "results_df" not in st.session_state:
-        st.session_state.results_df = pd.DataFrame()
+        st.session_state.results_df = load_checkpoint()
     if "prepared_df" not in st.session_state:
         st.session_state.prepared_df = pd.DataFrame()
+    if "source_df_ready" not in st.session_state:
+        st.session_state.source_df_ready = None
 
 
-# -----------------------------
-# UI
-# -----------------------------
 init_session()
 
+
+# ---------------------------------
+# UI
+# ---------------------------------
 st.title("Ringover · Preparación + Transcripciones")
-st.caption("Primero normaliza el fichero de actividades para obtener call_id y agente. Después descarga transcripciones y analiza keywords.")
+st.caption(
+    "Primero normaliza el fichero de actividades para obtener call_id y agente. "
+    "Después descarga transcripciones y analiza keywords."
+)
 
 with st.sidebar:
     st.header("Configuración")
@@ -262,17 +334,34 @@ with st.sidebar:
         value=200,
         step=50,
     )
+    autosave_every = st.number_input(
+        "Guardar checkpoint cada X llamadas",
+        min_value=1,
+        max_value=500,
+        value=AUTOSAVE_EVERY,
+        step=1,
+    )
     only_success = st.checkbox("Ocultar filas con error", value=False)
+
+    checkpoint_df_sidebar = load_checkpoint()
+    if not checkpoint_df_sidebar.empty:
+        st.success(f"Checkpoint detectado: {len(checkpoint_df_sidebar)} llamadas guardadas")
+    else:
+        st.info("No hay checkpoint guardado")
+
 
 tab1, tab2 = st.tabs(["1. Preparar archivo de actividades", "2. Descargar transcripciones"])
 
 
-# -----------------------------
-# TAB 1 - Preparación
-# -----------------------------
+# ---------------------------------
+# TAB 1 - PREPARACIÓN
+# ---------------------------------
 with tab1:
     st.subheader("Preparar archivo de actividades")
-    st.write("Sube el Excel o CSV exportado de actividades para extraer automáticamente los call_id desde la columna con la URL.")
+    st.write(
+        "Sube el Excel o CSV exportado de actividades para extraer automáticamente "
+        "los call_id desde la columna con la URL."
+    )
 
     activities_file = st.file_uploader(
         "Sube el fichero de actividades",
@@ -306,8 +395,15 @@ with tab1:
             index=default_url_idx if len(columns) > 0 else 0,
         )
 
-        agent_candidates = [c for c in columns if "agent" in c.lower() or "owner" in c.lower() or "agente" in c.lower() or "user" in c.lower()]
+        agent_candidates = [
+            c for c in columns
+            if "agent" in c.lower()
+            or "owner" in c.lower()
+            or "agente" in c.lower()
+            or "user" in c.lower()
+        ]
         default_agent = agent_candidates[0] if agent_candidates else columns[0]
+
         agent_col = st.selectbox(
             "Columna del agente",
             options=columns,
@@ -356,9 +452,9 @@ with tab1:
             st.success("Ya tienes el fichero preparado. Puedes ir a la pestaña 2 directamente.")
 
 
-# -----------------------------
-# TAB 2 - Transcripciones
-# -----------------------------
+# ---------------------------------
+# TAB 2 - TRANSCRIPCIONES
+# ---------------------------------
 with tab2:
     st.subheader("Descargar transcripciones")
 
@@ -376,7 +472,7 @@ with tab2:
             source_df = st.session_state.prepared_df[["call_id", "agente"]].copy()
             st.session_state["source_df_ready"] = source_df
 
-    if "source_df_ready" in st.session_state:
+    if st.session_state.get("source_df_ready") is not None:
         source_df = st.session_state["source_df_ready"]
 
     if uploaded_file is not None:
@@ -395,14 +491,36 @@ with tab2:
             st.error(f"Faltan columnas obligatorias: {missing}")
             st.stop()
 
-        col_a, col_b = st.columns([1, 1])
+        work_preview = prepare_source_df(source_df)
+        checkpoint_df = load_checkpoint()
+
+        processed_ids_preview = set()
+        if not checkpoint_df.empty and "call_id" in checkpoint_df.columns:
+            processed_ids_preview = set(checkpoint_df["call_id"].astype(str).tolist())
+
+        pending_preview = work_preview[~work_preview["call_id"].astype(str).isin(processed_ids_preview)].copy()
+
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Total a procesar", len(work_preview))
+        p2.metric("Ya guardadas en checkpoint", len(processed_ids_preview))
+        p3.metric("Pendientes", len(pending_preview))
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
         with col_a:
             run_button = st.button("Descargar y analizar", type="primary", use_container_width=True)
         with col_b:
-            clear_button = st.button("Limpiar resultados", use_container_width=True)
+            reload_button = st.button("Recargar checkpoint", use_container_width=True)
+        with col_c:
+            clear_button = st.button("Limpiar resultados y checkpoint", use_container_width=True)
+
+        if reload_button:
+            st.session_state.results_df = load_checkpoint()
+            st.rerun()
 
         if clear_button:
             st.session_state.results_df = pd.DataFrame()
+            clear_checkpoint()
+            st.success("Resultados y checkpoint eliminados.")
             st.rerun()
 
         if run_button:
@@ -410,27 +528,59 @@ with tab2:
                 st.error("Introduce la API key de Ringover.")
                 st.stop()
 
-            work = source_df[["call_id", "agente"]].copy()
-            work["call_id"] = work["call_id"].apply(clean_call_id)
-            work["agente"] = work["agente"].fillna("").astype(str).str.strip()
-            work = work[work["call_id"] != ""].copy()
-            work = work.drop_duplicates(subset=["call_id", "agente"])
-
+            work = prepare_source_df(source_df)
             headers = make_headers(api_key)
-            rows: List[Dict[str, Any]] = []
+
+            checkpoint_df = load_checkpoint()
+            if checkpoint_df.empty:
+                results_df = pd.DataFrame()
+                processed_ids = set()
+            else:
+                results_df = checkpoint_df.copy()
+                if "call_id" in checkpoint_df.columns:
+                    processed_ids = set(checkpoint_df["call_id"].astype(str).tolist())
+                else:
+                    processed_ids = set()
+
+            pending_work = work[~work["call_id"].astype(str).isin(processed_ids)].copy()
+
+            total_all = len(work)
+            total_done = len(processed_ids)
+            total_pending = len(pending_work)
+
+            st.info(
+                f"Total llamadas: {total_all} · "
+                f"Ya procesadas: {total_done} · "
+                f"Pendientes: {total_pending}"
+            )
+
             progress = st.progress(0)
             status = st.empty()
 
-            total = len(work)
-            for idx, row in enumerate(work.itertuples(index=False), start=1):
-                call_id = row.call_id
-                agente = row.agente
-                status.info(f"Procesando {idx}/{total} · call_id={call_id} · agente={agente}")
-                rows.append(fetch_one_call(call_id, agente, headers, sleep_ms=int(sleep_ms)))
-                progress.progress(idx / total)
+            if total_pending == 0:
+                st.session_state.results_df = results_df
+                status.success("No quedan llamadas pendientes. Ya estaba todo procesado.")
+            else:
+                for idx, row in enumerate(pending_work.itertuples(index=False), start=1):
+                    call_id = row.call_id
+                    agente = row.agente
 
-            st.session_state.results_df = pd.DataFrame(rows)
-            status.success("Proceso completado.")
+                    status.info(
+                        f"Procesando {idx}/{total_pending} · call_id={call_id} · agente={agente}"
+                    )
+
+                    result = fetch_one_call(call_id, agente, headers, sleep_ms=int(sleep_ms))
+                    results_df = pd.concat([results_df, pd.DataFrame([result])], ignore_index=True)
+
+                    if idx % int(autosave_every) == 0 or idx == total_pending:
+                        save_checkpoint(results_df)
+                        st.session_state.results_df = results_df
+
+                    progress.progress(idx / total_pending)
+
+                save_checkpoint(results_df)
+                st.session_state.results_df = results_df
+                status.success("Proceso completado.")
 
     results_df = st.session_state.results_df
 
@@ -485,7 +635,6 @@ with tab2:
             calls_without_keyword = total_calls - calls_with_keyword
 
             pct_total = round((calls_with_keyword / total_calls) * 100, 2) if total_calls else 0
-            pct_without = round((calls_without_keyword / total_calls) * 100, 2) if total_calls else 0
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total llamadas", total_calls)
@@ -545,7 +694,6 @@ with tab2:
                 use_container_width=True,
             )
 
-            # Resumen por agente de las llamadas sin keyword
             summary_without_df = (
                 view_df.groupby("agente", dropna=False)
                 .agg(
@@ -572,6 +720,7 @@ with tab2:
                 file_name="resumen_sin_keyword_por_agente.csv",
                 mime="text/csv",
             )
+
         st.markdown("### Llamadas sin transcripción")
         sin_transcripcion_df = view_df[~view_df["tiene_transcripcion"]].copy()
         st.dataframe(
